@@ -2,8 +2,10 @@ import pytest
 from traitlets.config import Config
 
 from jupyter_server.services.kernels.kernelmanager import (
+    HAS_ASYNC_ZMQ_STREAM,
     AsyncMappingKernelManager,
     MappingKernelManager,
+    ServerKernelManager,
 )
 
 
@@ -50,3 +52,25 @@ def test_kernel_start_kwargs_transport_encryption_required_sets_policy():
 
     assert launch_kwargs["transport_encryption"] == "required"
     assert launch_kwargs["env"] == {"EXISTING": "1"}
+
+
+@pytest.mark.skipif(not HAS_ASYNC_ZMQ_STREAM, reason="requires jupyter_client >= 8.10")
+def test_server_kernel_manager_takes_sockets_unwrapped():
+    """jupyter-server awaits the kernel sockets rather than using callbacks."""
+    assert ServerKernelManager().stream_class is None
+
+
+@pytest.mark.skipif(not HAS_ASYNC_ZMQ_STREAM, reason="requires jupyter_client >= 8.10")
+async def test_kernel_channels_are_asyncio_sockets(jp_serverapp):
+    """connect_* hands back awaitable sockets, not callback streams."""
+    import zmq.asyncio
+
+    kernel_id = await jp_serverapp.kernel_manager.start_kernel()
+    kernel = jp_serverapp.kernel_manager.get_kernel(kernel_id)
+    stream = kernel.connect_shell()
+    try:
+        assert isinstance(stream, zmq.asyncio.Socket)
+        assert not stream.closed
+    finally:
+        stream.close()
+        await jp_serverapp.kernel_manager.shutdown_kernel(kernel_id, now=True)

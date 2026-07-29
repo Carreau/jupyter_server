@@ -9,7 +9,6 @@ import pytest
 from jupyter_client.jsonutil import json_clean, json_default
 from jupyter_client.session import Session
 from tornado.httpserver import HTTPRequest
-from zmq.eventloop.zmqstream import ZMQStream
 
 from jupyter_server.serverapp import ServerApp
 from jupyter_server.services.kernels.connection.channels import ZMQChannelsWebsocketConnection
@@ -29,7 +28,7 @@ async def test_websocket_connection(jp_serverapp: ServerApp) -> None:
     handler.connection = conn
     await conn.prepare()
     await conn.connect()
-    await asyncio.wrap_future(conn.nudge())
+    await conn.nudge()
     session: Session = kernel.session
     msg = session.msg("data_pub", content={"a": "b"})
     data = json.dumps(
@@ -39,7 +38,7 @@ async def test_websocket_connection(jp_serverapp: ServerApp) -> None:
         allow_nan=False,
     )
     conn.handle_incoming_message(data)
-    conn.handle_outgoing_message("iopub", session.serialize(msg))
+    await conn.handle_outgoing_message("iopub", session.serialize(msg))
     assert (
         conn.websocket_handler.select_subprotocol(["v1.kernel.websocket.jupyter.org"])
         == "v1.kernel.websocket.jupyter.org"
@@ -84,34 +83,37 @@ async def test_nudge_cleanup_closes_transient_channels_when_iopub_closed(
     conn.create_stream()
     conn.kernel_info_timeout = 0.1
 
-    # Track transient ZMQStreams created by nudge() from this point forward.
+    # Track the transient sockets nudge() opens from this point forward.
     created: list = []
-    orig_init = ZMQStream.__init__
 
-    def tracking_init(self, *args, **kwargs):
-        orig_init(self, *args, **kwargs)
-        created.append(self)
+    def tracking(orig):
+        def connect(*args, **kwargs):
+            socket = orig(*args, **kwargs)
+            created.append(socket)
+            return socket
 
-    ZMQStream.__init__ = tracking_init  # type: ignore[method-assign]
-    try:
-        # nudge() synchronously registers on_recv callbacks on iopub, then
-        # returns. Close iopub immediately after so that when the cleanup
-        # done-callback eventually fires, iopub is already closed and
-        # iopub.stop_on_recv() hits the OSError path.
-        f = conn.nudge()
+        return connect
+
+    with (
+        patch.object(kernel, "connect_shell", tracking(kernel.connect_shell)),
+        patch.object(kernel, "connect_control", tracking(kernel.connect_control)),
+    ):
+        # Close the shared iopub channel out from under nudge, so its wait for
+        # an iopub message can never be satisfied. The transient shell/control
+        # sockets it owns must still be cleaned up.
+        task = asyncio.ensure_future(conn.nudge())
+        await asyncio.sleep(0)
         conn.channels["iopub"].close()
         try:
-            await asyncio.wait_for(asyncio.wrap_future(f), timeout=2.0)
+            await asyncio.wait_for(task, timeout=2.0)
         except Exception:
             pass
         await asyncio.sleep(0.2)
-    finally:
-        ZMQStream.__init__ = orig_init  # type: ignore[method-assign]
 
-    still_open = [s for s in created if not s.closed()]
+    still_open = [s for s in created if not s.closed]
     assert not still_open, (
-        f"nudge leaked {len(still_open)} transient ZMQStream(s) when iopub "
-        f"was closed before cleanup fired"
+        f"nudge leaked {len(still_open)} transient socket(s) when iopub "
+        f"was closed before cleanup ran"
     )
 
 
@@ -135,7 +137,7 @@ async def test_no_fd_leak_on_buffer_restore_with_port_change(jp_serverapp: Serve
     except Exception:
         pass
     for s in conn.channels.values():
-        if not s.closed():
+        if not s.closed:
             s.close()
     gc.collect()
     await asyncio.sleep(1)
@@ -156,14 +158,12 @@ async def test_no_fd_leak_on_buffer_restore_with_port_change(jp_serverapp: Serve
         conn2 = _make_connection(app, kernel, session_id=session_id)
         km._kernel_connections[kernel_id] = 1
         with patch.object(km, "ports_changed", return_value=True):
-            connected = conn2.connect()
-        if connected:
             try:
-                await connected
+                await conn2.connect()
             except Exception:
                 pass
         for s in conn2.channels.values():
-            if not s.closed():
+            if not s.closed:
                 s.close()
         conn2.channels = {}
 
@@ -259,3 +259,38 @@ async def test_disconnect_resolves_orphaned_kernel_info_future(jp_serverapp: Ser
     conn2.session.key = kernel.session.key
     conn2.kernel_info_timeout = 0.2
     await asyncio.wait_for(asyncio.wrap_future(conn2.request_kernel_info()), timeout=1.0)
+
+
+async def test_iopub_is_never_blocked_by_a_slow_websocket(jp_serverapp: ServerApp) -> None:
+    """iopub must keep draining even when the browser is behind.
+
+    iopub is an XPUB/SUB channel, and libzmq silently discards messages once a
+    PUB socket reaches its high-water mark. Declining to read iopub in order to
+    apply backpressure would therefore lose kernel output with no error. The
+    request/reply channels have no such hazard and do wait.
+    """
+    app = jp_serverapp
+    km = app.kernel_manager
+    kernel_id = await km.start_kernel()
+    kernel = km.get_kernel(kernel_id)
+    conn = _make_connection(app, kernel)
+
+    # A writer that never drains, and a full queue, so any awaiting put blocks.
+    conn._outgoing = asyncio.Queue(maxsize=2)
+    conn._writer_task = asyncio.ensure_future(asyncio.sleep(3600))
+    while not conn._outgoing.full():
+        conn._outgoing.put_nowait((b"filler", True))
+
+    try:
+        # iopub returns immediately despite the full queue...
+        await asyncio.wait_for(conn._enqueue("iopub", b"iopub-msg", True), timeout=1.0)
+
+        # ...and the message is not dropped, just waiting its turn.
+        assert conn._pending_puts
+
+        # A request/reply channel does wait, which is where backpressure is safe.
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(conn._enqueue("shell", b"shell-msg", True), timeout=0.25)
+    finally:
+        conn._stop_pumps()
+        await km.shutdown_kernel(kernel_id, now=True)

@@ -15,11 +15,15 @@ import sys
 import time
 import typing as t
 import warnings
+import weakref
 from collections import defaultdict
 from datetime import datetime, timedelta
-from functools import partial, wraps
+from functools import wraps
 
-from jupyter_client.ioloop.manager import AsyncIOLoopKernelManager
+import jupyter_client
+import zmq
+import zmq.asyncio
+from jupyter_client.ioloop.manager import AsyncIOLoopKernelManager, IOLoopKernelManager
 from jupyter_client.multikernelmanager import AsyncMultiKernelManager, MultiKernelManager
 from jupyter_client.session import Session
 from jupyter_core.paths import exists
@@ -54,6 +58,46 @@ from jupyter_server._tz import isoformat, utcnow
 from jupyter_server.prometheus.metrics import KERNEL_CURRENTLY_RUNNING_TOTAL
 from jupyter_server.utils import ApiPath, import_item, to_os_path
 
+# jupyter_client 8.10 lets connect_* hand back the raw socket instead of a
+# callback wrapper, via the stream_class trait.
+HAS_ASYNC_ZMQ_STREAM = jupyter_client.version_info >= (8, 10)  # type:ignore[attr-defined]
+
+
+#: shadow socket -> the original it was shadowed from, pinning its lifetime
+_shadowed_sockets: weakref.WeakKeyDictionary[t.Any, t.Any] = weakref.WeakKeyDictionary()
+
+
+def as_awaitable_socket(socket):
+    """Return a socket that can be awaited.
+
+    An async kernel manager configured with ``stream_class=None`` already hands
+    back a ``zmq.asyncio.Socket``. A synchronous one produces a plain
+    ``zmq.Socket``, and a manager still using the default ``stream_class``
+    produces a callback stream. All three are normalised here, so that every
+    consumer in jupyter-server can simply await its channel.
+
+    Sockets are shadowed rather than re-created: the shadow shares the
+    underlying zmq socket, so the connection and its options are preserved.
+    """
+    if isinstance(socket, zmq.asyncio.Socket):
+        return socket
+    if not isinstance(socket, zmq.Socket):
+        # A ZMQStream-style wrapper, from a kernel manager that subclasses
+        # jupyter-client's AsyncIOLoopKernelManager directly and so still has
+        # the default stream_class. Adopt its socket and neutralise the
+        # wrapper: a freshly built stream has registered nothing on the event
+        # loop, and clearing .socket stops it closing the socket underneath us.
+        wrapper, socket = socket, socket.socket
+        wrapper.socket = None
+    shadow = zmq.asyncio.Socket.shadow(socket.underlying)
+    # A shadow does not own the underlying zmq socket, and the original's
+    # finalizer would close it out from under the shadow. Keep the original
+    # alive for exactly as long as the shadow; closing the shadow closes the
+    # underlying socket for both. (pyzmq turns attribute assignment on a Socket
+    # into setsockopt, so this cannot simply hang off the shadow.)
+    _shadowed_sockets[shadow] = socket
+    return shadow
+
 
 class MappingKernelManager(MultiKernelManager):
     """A KernelManager that handles
@@ -64,6 +108,8 @@ class MappingKernelManager(MultiKernelManager):
 
     @default("kernel_manager_class")
     def _default_kernel_manager_class(self):
+        if HAS_ASYNC_ZMQ_STREAM:
+            return "jupyter_server.services.kernels.kernelmanager.ServerSyncKernelManager"
         return "jupyter_client.ioloop.IOLoopKernelManager"
 
     kernel_argv = List(Unicode())
@@ -368,13 +414,13 @@ class MappingKernelManager(MultiKernelManager):
             The session_key, if any, that should get the buffer.
             If the session_key matches the current buffered session_key,
             the buffer will be returned.
-        channels : dict({'channel': ZMQStream})
+        channels : dict({'channel': zmq.asyncio.Socket})
             The zmq channels whose messages should be buffered.
         """
 
         if not self.buffer_offline_messages:
-            for stream in channels.values():
-                stream.close()
+            for socket in channels.values():
+                socket.close()
             return
 
         self.log.info("Starting buffering for %s", session_key)
@@ -387,14 +433,20 @@ class MappingKernelManager(MultiKernelManager):
         # TODO: the buffer should likely be a memory bounded queue, we're starting with a list to keep it simple
         buffer_info["buffer"] = []
         buffer_info["channels"] = channels
+        buffer_info["tasks"] = {}
 
         # forward any future messages to the internal buffer
-        def buffer_msg(channel, msg_parts):
-            self.log.debug("Buffering msg on %s:%s", kernel_id, channel)
-            buffer_info["buffer"].append((channel, msg_parts))
+        async def buffer_channel(channel, socket):
+            while True:
+                try:
+                    msg_parts = await socket.recv_multipart()
+                except (asyncio.CancelledError, zmq.ZMQError):
+                    return
+                self.log.debug("Buffering msg on %s:%s", kernel_id, channel)
+                buffer_info["buffer"].append((channel, msg_parts))
 
-        for channel, stream in channels.items():
-            stream.on_recv(partial(buffer_msg, channel))
+        for channel, socket in channels.items():
+            buffer_info["tasks"][channel] = asyncio.ensure_future(buffer_channel(channel, socket))
 
     def get_buffer(self, kernel_id, session_key):
         """Get the buffer for a given kernel
@@ -416,10 +468,19 @@ class MappingKernelManager(MultiKernelManager):
         if buffer_info["session_key"] == session_key:
             # remove buffer
             self._kernel_buffers.pop(kernel_id)
+            # Stop reading the sockets before handing them to the caller. Only
+            # one consumer may await a socket at a time, so leaving the buffer
+            # tasks running would race the reconnecting websocket for messages.
+            self._cancel_buffer_tasks(buffer_info)
             # only return buffer_info if it's a match
             return buffer_info
         else:
             self.stop_buffering(kernel_id)
+
+    def _cancel_buffer_tasks(self, buffer_info):
+        """Stop the tasks draining a buffered kernel's sockets."""
+        for task in buffer_info.pop("tasks", {}).values():
+            task.cancel()
 
     def stop_buffering(self, kernel_id):
         """Stop buffering kernel messages
@@ -435,11 +496,11 @@ class MappingKernelManager(MultiKernelManager):
         if kernel_id not in self._kernel_buffers:
             return
         buffer_info = self._kernel_buffers.pop(kernel_id)
-        # close buffering streams
-        for stream in buffer_info["channels"].values():
-            if not stream.socket.closed:
-                stream.on_recv(None)
-                stream.close()
+        # stop draining, then close the buffering sockets
+        self._cancel_buffer_tasks(buffer_info)
+        for socket in buffer_info["channels"].values():
+            if not socket.closed:
+                socket.close()
 
         msg_buffer = buffer_info["buffer"]
         if msg_buffer:
@@ -481,9 +542,16 @@ class MappingKernelManager(MultiKernelManager):
 
         def finish():
             """Common cleanup when restart finishes/fails for any reason."""
-            if not channel.closed():  # type:ignore[operator]
+            if not channel.closed:
                 channel.close()
-            loop.remove_timeout(timeout)
+            # Do not cancel the task we may be running inside of: the reply
+            # handler calls finish() itself.
+            try:
+                current = asyncio.current_task()
+            except RuntimeError:  # pragma: no cover - no running loop
+                current = None
+            if reply_task is not None and reply_task is not current:
+                reply_task.cancel()
             kernel.remove_restart_callback(on_restart_failed, "dead")
             kernel._pending_restart_cleanup = None  # type:ignore[attr-defined]
 
@@ -505,12 +573,30 @@ class MappingKernelManager(MultiKernelManager):
             if not future.done():
                 future.set_exception(RuntimeError("Restart failed"))
 
+        async def await_reply():
+            """Wait for the kernel_info reply, or give up."""
+            try:
+                msg = await asyncio.wait_for(
+                    channel.recv_multipart(), timeout=self.kernel_info_timeout
+                )
+            except asyncio.CancelledError:
+                return
+            except asyncio.TimeoutError:
+                on_timeout()
+                return
+            except Exception:
+                self.log.warning("Error waiting for kernel_info_reply: %s", kernel_id)
+                finish()
+                if not future.done():
+                    future.set_exception(RuntimeError("Restart failed"))
+                return
+            on_reply(msg)
+
+        reply_task: asyncio.Task[Any] | None = None
         kernel.add_restart_callback(on_restart_failed, "dead")
         kernel._pending_restart_cleanup = finish  # type:ignore[attr-defined]
         kernel.session.send(channel, "kernel_info_request")
-        channel.on_recv(on_reply)  # type:ignore[operator]
-        loop = IOLoop.current()
-        timeout = loop.add_timeout(loop.time() + self.kernel_info_timeout, on_timeout)
+        reply_task = asyncio.ensure_future(await_reply())
         # Re-establish activity watching if ports have changed...
         if self._get_changed_ports(kernel_id) is not None:
             self.stop_watching_activity(kernel_id)
@@ -615,7 +701,7 @@ class MappingKernelManager(MultiKernelManager):
         # add busy/activity markers:
         kernel.reason = ""
         kernel.last_activity = utcnow()
-        kernel._activity_stream = kernel.connect_iopub()
+        kernel._activity_stream = as_awaitable_socket(kernel.connect_iopub())
         session = Session(
             config=kernel.session.config,
             key=kernel.session.key,
@@ -654,13 +740,31 @@ class MappingKernelManager(MultiKernelManager):
             else:
                 self.log.debug("activity on %s: %s", kernel_id, msg_type)
 
-        kernel._activity_stream.on_recv(record_activity)
+        async def watch_activity():
+            socket = kernel._activity_stream
+            while True:
+                try:
+                    msg_list = await socket.recv_multipart()
+                except (asyncio.CancelledError, zmq.ZMQError):
+                    return
+                try:
+                    record_activity(msg_list)
+                except Exception:
+                    # A malformed message must not kill the watcher; without a
+                    # live watcher the kernel would look permanently idle to
+                    # the culler.
+                    self.log.exception("Error recording activity on %s", kernel_id)
+
+        kernel._activity_task = asyncio.ensure_future(watch_activity())
 
     def stop_watching_activity(self, kernel_id):
         """Stop watching IOPub messages on a kernel for activity."""
         kernel = self._kernels[kernel_id]
+        if getattr(kernel, "_activity_task", None):
+            kernel._activity_task.cancel()
+            kernel._activity_task = None
         if getattr(kernel, "_activity_stream", None):
-            if not kernel._activity_stream.socket.closed:
+            if not kernel._activity_stream.closed:
                 kernel._activity_stream.close()
             kernel._activity_stream = None
         if getattr(kernel, "_pending_restart_cleanup", None):
@@ -867,8 +971,49 @@ def emit_kernel_action_event(success_msg: str = "") -> t.Callable[..., t.Any]:
     return wrap_method
 
 
+def _awaitable_connect(f: t.Any) -> t.Any:
+    """Wrap a connect_* method so that it returns an awaitable socket."""
+
+    @wraps(f)
+    def wrapped(self: t.Any, *args: t.Any, **kwargs: t.Any) -> t.Any:
+        return as_awaitable_socket(f(self, *args, **kwargs))
+
+    return wrapped
+
+
+class ServerSyncKernelManager(IOLoopKernelManager):
+    """The synchronous counterpart of ServerKernelManager.
+
+    MappingKernelManager's kernels are synchronous, so their sockets are plain
+    zmq.Sockets. Everything that consumes a kernel channel in jupyter-server
+    awaits it, so the connect_* methods are wrapped once here rather than at
+    each of the call sites (channel setup, nudge, kernel_info, restart).
+    """
+
+    if HAS_ASYNC_ZMQ_STREAM:
+
+        @default("stream_class")
+        def _stream_class_default(self) -> t.Any:
+            return None
+
+        connect_shell = _awaitable_connect(IOLoopKernelManager.connect_shell)
+        connect_control = _awaitable_connect(IOLoopKernelManager.connect_control)
+        connect_iopub = _awaitable_connect(IOLoopKernelManager.connect_iopub)
+        connect_stdin = _awaitable_connect(IOLoopKernelManager.connect_stdin)
+
+
 class ServerKernelManager(AsyncIOLoopKernelManager):
     """A server-specific kernel manager."""
+
+    if HAS_ASYNC_ZMQ_STREAM:
+        # Take the sockets unwrapped and await them. jupyter-server drives the
+        # kernel channels from the asyncio loop it already runs on, so a
+        # callback wrapper buys nothing and costs the ability to apply
+        # backpressure or to let an error propagate. jupyter-client makes this
+        # the default in 9.0.
+        @default("stream_class")
+        def _stream_class_default(self) -> t.Any:
+            return None
 
     # Define activity-related attributes:
     execution_state = Unicode(
