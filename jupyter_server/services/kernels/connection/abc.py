@@ -25,5 +25,9 @@ class KernelWebsocketConnectionABC(ABC):
         """Broker the incoming websocket message to the appropriate ZMQ channel."""
 
     @abstractmethod
-    def handle_outgoing_message(self, stream: str, outgoing_msg: list[Any]) -> None:
-        """Broker outgoing ZMQ messages to the kernel websocket."""
+    async def handle_outgoing_message(self, stream: str, outgoing_msg: list[Any]) -> None:
+        """Broker outgoing ZMQ messages to the kernel websocket.
+
+        Awaitable so that implementations can await the websocket write, which
+        is what lets a slow client apply backpressure to the kernel.
+        """

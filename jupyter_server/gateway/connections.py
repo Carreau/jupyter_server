@@ -102,7 +102,7 @@ class GatewayWebSocketConnection(BaseKernelWebsocketConnection):
                     break
                 if isinstance(message, bytes):
                     message = message.decode("utf8")
-                self.handle_outgoing_message(
+                await self.handle_outgoing_message(
                     message
                 )  # pass back to notebook client (see self.on_open and WebSocketChannelsHandler.open)
             else:  # ws cancelled - stop reading
@@ -130,7 +130,7 @@ class GatewayWebSocketConnection(BaseKernelWebsocketConnection):
             loop = IOLoop.current()
             loop.spawn_callback(self.connect)
 
-    def handle_outgoing_message(self, incoming_msg: str, *args: Any) -> None:
+    async def handle_outgoing_message(self, incoming_msg: str, *args: Any) -> None:
         """Send message to the notebook client."""
         try:
             self.websocket_handler.write_message(incoming_msg)

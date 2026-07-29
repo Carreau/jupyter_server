@@ -173,7 +173,7 @@ class BaseKernelWebsocketConnection(LoggingConfigurable):
         """Handle an incoming message."""
         raise NotImplementedError
 
-    def handle_outgoing_message(self, stream: str, outgoing_msg: list[Any]) -> None:
+    async def handle_outgoing_message(self, stream: str, outgoing_msg: list[Any]) -> None:
         """Handle an outgoing message."""
         raise NotImplementedError
 
