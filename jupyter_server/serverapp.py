@@ -3224,6 +3224,8 @@ class ServerApp(JupyterApp):
             self.kernel_manager.__del__()
         if getattr(self, "session_manager", None):
             self.session_manager.close()
+        if getattr(self, "contents_manager", None):
+            self.contents_manager.close()
         if hasattr(self, "http_server"):
             # Stop a server if its set.
             self.http_server.stop()

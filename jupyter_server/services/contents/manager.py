@@ -10,12 +10,14 @@ import os
 import re
 import typing as t
 import warnings
+import weakref
 from fnmatch import fnmatch
 
 from jupyter_core.utils import ensure_async, run_sync
 from jupyter_events import EventLogger
 from nbformat import ValidationError, sign
 from nbformat import validate as validate_nb
+from nbformat import version_info as nbformat_version_info
 from nbformat.v4 import new_notebook
 from tornado.web import HTTPError, RequestHandler
 from traitlets import (
@@ -28,6 +30,7 @@ from traitlets import (
     Type,
     Unicode,
     default,
+    observe,
     validate,
 )
 from traitlets.config.configurable import LoggingConfigurable
@@ -40,6 +43,29 @@ from ...files.handlers import FilesHandler
 from .checkpoints import AsyncCheckpoints, Checkpoints
 
 copy_pat = re.compile(r"\-Copy\d*\.")
+
+# nbformat 5.11 added the context-manager protocol (`__enter__`/`__exit__`/`close`)
+# to NotebookNotary, and deprecated using a notary outside of it.
+# TODO: drop this and the `if not _NOTARY_IS_CONTEXT_MANAGER` branches below once
+# the minimum supported nbformat is >= 5.11.
+_NOTARY_IS_CONTEXT_MANAGER = nbformat_version_info >= (5, 11)
+
+
+def _close_notary(notary_ref: weakref.ReferenceType[sign.NotebookNotary]) -> None:
+    """Close the signature store of a notary, if the notary is still alive.
+
+    Used as a :class:`weakref.finalize` callback, so it must not hold a strong
+    reference to the notary (which holds a reference back to the contents
+    manager via ``parent``, and would keep it alive forever).
+    """
+    notary = notary_ref()
+    if notary is None:
+        return
+    if _NOTARY_IS_CONTEXT_MANAGER:
+        # Pair with the `__enter__()` call in `ContentsManager._adopt_notary`.
+        notary.__exit__(None, None, None)
+    else:
+        notary.store.close()
 
 
 class ContentsManager(LoggingConfigurable):
@@ -115,9 +141,55 @@ class ContentsManager(LoggingConfigurable):
 
     notary = Instance(sign.NotebookNotary)
 
+    def __init__(self, **kwargs):
+        """Initialize the contents manager."""
+        # Finalizers closing the signature stores of the notaries we adopted.
+        # Set before super().__init__() since configuring `notary` fires the
+        # observer below from within it.
+        self._notary_finalizers: list[weakref.finalize] = []
+        super().__init__(**kwargs)
+
     @default("notary")
     def _notary_default(self):
-        return sign.NotebookNotary(parent=self)
+        notary = sign.NotebookNotary(parent=self)
+        self._adopt_notary(notary)
+        return notary
+
+    @observe("notary")
+    def _notary_changed(self, change):
+        self._adopt_notary(change["new"])
+
+    def _adopt_notary(self, notary):
+        """Take ownership of a notary for the lifetime of this contents manager.
+
+        A notary holds resources (an SQLite connection for the default signature
+        store), and as of nbformat 5.11 it is meant to be used as a context
+        manager so that those resources are released; using it outside of a
+        ``with`` block raises a ``PendingDeprecationWarning``.
+
+        The notary's useful lifetime here is that of the contents manager, not
+        that of a single signature check, so we enter its context once and close
+        it from a finalizer instead of wrapping every individual call.
+        """
+        if _NOTARY_IS_CONTEXT_MANAGER:
+            # Marks the notary as context-managed, suppressing the
+            # pending-deprecation warning; `_close_notary` calls `__exit__`.
+            notary.__enter__()
+        finalizer = weakref.finalize(self, _close_notary, weakref.ref(notary))
+        # Also runs at interpreter exit, which is the usual case for a
+        # long-lived server whose contents manager is never collected.
+        self._notary_finalizers.append(finalizer)
+
+    def close(self):
+        """Release the resources held by this contents manager.
+
+        Closes the signature store(s) of the notebook notary. Called
+        automatically when the contents manager is garbage collected or at
+        interpreter exit, but may be called explicitly to release resources
+        sooner.
+        """
+        while self._notary_finalizers:
+            self._notary_finalizers.pop()()
 
     hide_globs = List(
         Unicode(),
@@ -735,6 +807,11 @@ class ContentsManager(LoggingConfigurable):
             # and falls back to MemorySignatureStore if not; SQLiteSignatureStore will
             # attempt to recreate the database if it detects errors during initialization,
             # and fallback to in-memory (`:memory:`) SQLite database if necessary.
+            try:
+                self.notary.store.close()
+            except Exception:  # noqa: S110
+                # The store is broken; releasing its resources is best-effort.
+                pass
             self.notary.store = self.notary.store_factory()
             self.check_and_sign(nb, path, _retrying=True)
 

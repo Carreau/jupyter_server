@@ -1,8 +1,10 @@
 import math
 import os
 import shutil
+import sqlite3
 import sys
 import time
+import warnings
 from itertools import combinations
 from unittest.mock import MagicMock, patch
 
@@ -1221,6 +1223,54 @@ async def test_save_raises_when_signature_store_unrecoverable(file_manager_with_
             await ensure_async(cm.save(full_model, path))
     assert exc_info.value.status_code == 500
     assert "corrupted or unavailable" in caplog.text
+
+
+async def test_notary_used_as_context_manager(file_manager_with_notary):
+    """Notary calls must not warn: the manager owns the notary's context."""
+    cm = file_manager_with_notary
+
+    # Everything touching the notary must happen inside the block: the notary
+    # only warns once, so a call made before it would hide the warning.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        model = await ensure_async(cm.new_untitled(type="notebook"))
+        path = model["path"]
+        full_model = await ensure_async(cm.get(path))
+        nb = full_model["content"]
+        cm.mark_trusted_cells(nb, path)
+        cm.check_and_sign(nb, path)
+        await ensure_async(cm.trust_notebook(path))
+
+    assert [str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)] == []
+    assert [
+        str(w.message) for w in caught if issubclass(w.category, PendingDeprecationWarning)
+    ] == []
+
+
+async def test_close_closes_notary_store(file_manager_with_notary):
+    """close() releases the signature store, and is idempotent."""
+    cm = file_manager_with_notary
+    model = await ensure_async(cm.new_untitled(type="notebook"))
+    await ensure_async(cm.get(model["path"]))
+    db = cm.notary.store.db
+
+    cm.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        db.execute("SELECT 1")
+    cm.close()
+
+
+def test_notary_replaced_after_use_is_also_closed(tmp_path):
+    """Both the default notary and one assigned later are adopted and closed."""
+    cm = FileContentsManager(root_dir=str(tmp_path))
+    first = cm.notary.store.db
+    cm.notary = NotebookNotary(data_dir=str(tmp_path / "notary2"))
+    second = cm.notary.store.db
+
+    cm.close()
+    for db in (first, second):
+        with pytest.raises(sqlite3.ProgrammingError):
+            db.execute("SELECT 1")
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS only - st_birthtime test")
