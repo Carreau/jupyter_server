@@ -189,6 +189,10 @@ filterwarnings = [
   "module:add_callback_from_signal is deprecated:DeprecationWarning",
   "ignore::jupyter_server.utils.JupyterServerAuthWarning",
 
+  # nbformat 5.11 warns when NotebookNotary is used outside a `with` block; api still unclear.
+  "ignore:Using NotebookNotary without a .with. block is deprecated:PendingDeprecationWarning",
+  # the ignored warnings is unclosed database is likely due to the non-closing of notary
+  # that the context manager would fix
   # ignore unclosed sqlite in traits
   "ignore:unclosed database in <sqlite3.Connection:ResourceWarning",
 ]
